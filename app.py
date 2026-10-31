@@ -20,6 +20,7 @@ LLM_BASE = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 DB_PATH = os.environ.get("DB_PATH", "incidents.db")
+LAST_MODEL_USED = LLM_MODEL
 
 app = FastAPI(redirect_slashes=False, docs_url=None, redoc_url=None, openapi_url=None)
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -105,20 +106,41 @@ async def call_model(inc, pol, catalog):
         "maximumDiagnostics": pol.get("maximumDiagnostics", 3),
         "transcript": inc["transcript"],
     }  # NOTE: the `sensitive` object is never included
-    async with httpx.AsyncClient(timeout=14) as c:
-        r = await c.post(
-            LLM_BASE.rstrip("/") + "/chat/completions",
-            headers={"Authorization": "Bearer " + LLM_KEY},
-            json={"model": LLM_MODEL, "temperature": 0,
-                  "response_format": {"type": "json_object"},
-                  "messages": [{"role": "system", "content": SYSTEM},
-                               {"role": "user", "content": json.dumps(user)}]})
-    r.raise_for_status()
-    j = r.json()
-    txt = j["choices"][0]["message"]["content"].strip()
-    txt = re.sub(r"^```(?:json)?|```$", "", txt).strip()
-    return json.loads(txt), j.get("usage") or {}
-
+    models = [LLM_MODEL]
+    if os.environ.get("LLM_FALLBACK_MODEL"):
+        models.append(os.environ["LLM_FALLBACK_MODEL"])
+    deadline = time.monotonic() + 15
+    last = None
+    for attempt in range(4):
+        model = models[attempt % len(models)]
+        left = deadline - time.monotonic()
+        if left < 2:
+            break
+        try:
+            async with httpx.AsyncClient(timeout=min(left, 8)) as c:
+                r = await c.post(
+                    LLM_BASE.rstrip("/") + "/chat/completions",
+                    headers={"Authorization": "Bearer " + LLM_KEY},
+                    json={"model": model, "temperature": 0,
+                          "response_format": {"type": "json_object"},
+                          "messages": [{"role": "system", "content": SYSTEM},
+                                       {"role": "user", "content": json.dumps(user)}]})
+            if r.status_code in (429, 500, 502, 503, 504):
+                last = r
+                await asyncio.sleep(1)
+                continue
+            r.raise_for_status()
+            j = r.json()
+            txt = j["choices"][0]["message"]["content"].strip()
+            txt = re.sub(r"^```(?:json)?|```$", "", txt).strip()
+            global LAST_MODEL_USED
+            LAST_MODEL_USED = model
+            return json.loads(txt), j.get("usage") or {}
+        except httpx.TimeoutException as e:
+            last = e
+    if isinstance(last, httpx.Response):
+        last.raise_for_status()
+    raise RuntimeError("model unavailable")
 
 def normalize(p, inc, pol, catalog, eids):
     """Validate/repair the model's answer in plain code (no second model call)."""
@@ -438,7 +460,11 @@ async def post_incident(request: Request):
             st, resp = await create_run(b, request.headers)
         except Bad:
             return err(422, "invalid body")
-        except Exception:
+        except Exception as e:
+            body = ""
+            if isinstance(e, httpx.HTTPStatusError):
+                body = e.response.text[:300]
+            print("PLANNER FAIL:", type(e).__name__, str(e)[:300], body, flush=True)
             return err(502, "planner unavailable")
         st["response"] = resp
         db.execute("insert into runs values(?,?,?)", (b["runId"], h, json.dumps(st)))
