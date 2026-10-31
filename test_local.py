@@ -14,6 +14,10 @@ import app as A
 from fastapi.testclient import TestClient
 
 client = TestClient(A.app)
+REMOTE = os.environ.get("REMOTE_URL")
+if REMOTE:
+    import httpx
+    client = httpx.Client(base_url=REMOTE, timeout=30)
 MODE = sys.argv[1] if len(sys.argv) > 1 else "mock"
 CANARY = "CANARY-" + uuid.uuid4().hex
 fails = 0

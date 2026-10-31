@@ -117,7 +117,7 @@ async def call_model(inc, pol, catalog):
         if left < 2:
             break
         try:
-            async with httpx.AsyncClient(timeout=min(left, 8)) as c:
+            async with httpx.AsyncClient(timeout=min(left, 14)) as c:
                 r = await c.post(
                     LLM_BASE.rstrip("/") + "/chat/completions",
                     headers={"Authorization": "Bearer " + LLM_KEY},
